@@ -3,6 +3,7 @@ import os
 from typing import Dict, List, Tuple, Set, Any
 import json
 import base64
+import logging
 from io import BytesIO
 from PIL import Image
 from urllib.parse import urlencode
@@ -61,6 +62,13 @@ RISK_FLAGS = {
 
 SEVERITY = {"none","low","medium","high","unknown"}
 INPUT_COLUMNS = ('user_id', 'image_paths', 'user_claim', 'claim_object')
+OUTPUT_COLUMNS = [
+    'user_id', 'image_paths', 'user_claim', 'claim_object',
+    'evidence_standard_met', 'evidence_standard_met_reason', 'risk_flags',
+    'issue_type', 'object_part', 'claim_status',
+    'claim_status_justification', 'supporting_image_ids', 'valid_image',
+    'severity',
+]
 
 
 class PipelineData:
@@ -307,34 +315,62 @@ def validate_and_repair(pipeline: PipelineData, raw: Dict[str, Any], row: Dict[s
     return r
 
 
+def _output_values(result: Dict[str, Any]) -> List[Any]:
+    values = []
+    for column in OUTPUT_COLUMNS:
+        value = result.get(column)
+        if column in ('risk_flags', 'supporting_image_ids'):
+            if isinstance(value, (list, set)):
+                value = ';'.join(value)
+        if isinstance(value, bool):
+            value = 'true' if value else 'false'
+        if value is None:
+            value = ''
+        values.append(value)
+    return values
+
+
 def write_output(results: List[Dict[str, Any]], output_path: str):
     # Column order per problem_statement.md
-    cols = [
-        'user_id','image_paths','user_claim','claim_object','evidence_standard_met',
-        'evidence_standard_met_reason','risk_flags','issue_type','object_part',
-        'claim_status','claim_status_justification','supporting_image_ids','valid_image','severity'
-    ]
     output_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(output_dir, exist_ok=True)
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(cols)
+        writer.writerow(OUTPUT_COLUMNS)
         for res in results:
-            row = []
-            for c in cols:
-                v = res.get(c)
-                if c == 'risk_flags':
-                    if isinstance(v, (list, set)):
-                        v = ';'.join(v)
-                if c == 'supporting_image_ids':
-                    if isinstance(v, (list, set)):
-                        v = ';'.join(v)
-                if isinstance(v, bool):
-                    v = 'true' if v else 'false'
-                if v is None:
-                    v = ''
-                row.append(v)
-            writer.writerow(row)
+            writer.writerow(_output_values(res))
+
+
+def _append_output_row(result: Dict[str, Any], output_path: str) -> None:
+    """Append and durably close one completed prediction row."""
+    with open(output_path, 'a', newline='', encoding='utf-8') as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(_output_values(result))
+        output_file.flush()
+        os.fsync(output_file.fileno())
+
+
+def _load_progress(progress_path: str) -> int:
+    if not os.path.isfile(progress_path):
+        return -1
+    with open(progress_path, 'r', encoding='utf-8') as progress_file:
+        progress = json.load(progress_file)
+    return int(progress.get('last_completed_index', -1))
+
+
+def _save_progress(progress_path: str, completed_index: int) -> None:
+    """Durably replace progress.json after its CSV row has been committed."""
+    temporary_path = progress_path + '.tmp'
+    with open(temporary_path, 'w', encoding='utf-8', newline='\n') as progress_file:
+        json.dump(
+            {'last_completed_index': completed_index},
+            progress_file,
+            indent=2,
+        )
+        progress_file.write('\n')
+        progress_file.flush()
+        os.fsync(progress_file.fileno())
+    os.replace(temporary_path, progress_path)
 
 
 def _load_system_prompt() -> str:
@@ -511,30 +547,60 @@ def _send_model_request(
 
 
 def classify_claim(pipeline: PipelineData, row: Dict[str, str], history_note: str, evidence_ctx: Dict[str, str]) -> Dict[str, Any]:
-    """Call Gemini/Qwen, with one additional call only after invalid JSON."""
+    """Run the same model-call sequence used by debug_raw_response.py."""
+    raw_images = row.get("image_paths", "")
+    print(f"Raw 'image_paths' from CSV: '{raw_images}'")
+
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
+    images = _encode_images(raw_images)
+
+    print(f"Encoded {len(images)} image(s)")
+    for image_id, image in images.items():
+        encoded_kb = len(image['data']) / 1024
+        print(f"  - {image_id}: {encoded_kb:.1f}KB base64")
+
     system_prompt = _load_system_prompt()
     if not system_prompt:
         raise FileNotFoundError(os.path.join(REPO_ROOT, 'prompt.md'))
+    print(f"System prompt length: {len(system_prompt)} chars")
 
     pieces = [
-        f"claim_object: {row.get('claim_object', '')}",
-        f"user_claim: {row.get('user_claim', '')}",
-        "evidence_requirement: "
-        f"{(evidence_ctx or {}).get('minimum_image_evidence', '')}",
-        f"history_note: {history_note}",
+        f"Claim object: {row.get('claim_object')}",
+        f"User claim: {row.get('user_claim')}",
     ]
-
-    images = _encode_images(row.get('image_paths',''))
-    pieces.append(f"image_ids: {', '.join(images) if images else 'none'}")
+    if evidence_ctx and evidence_ctx.get('minimum_image_evidence'):
+        pieces.append(
+            "Evidence requirement: "
+            f"{evidence_ctx.get('minimum_image_evidence')}"
+        )
+    pieces.append(f"History note: {history_note}")
+    if images:
+        pieces.append(f"Images: {', '.join(images.keys())}")
     user_message = "\n\n".join(pieces)
 
+    print("\n--- USER MESSAGE PREVIEW (first 700 chars) ---")
+    preview = user_message[:700] + ("..." if len(user_message) > 700 else "")
+    print(preview)
+    print(f"\n--- CALLING MODEL REQUEST ({len(images)} images) ---")
+
     content = _send_model_request(system_prompt, user_message, images)
+    print("\n--- RAW RESPONSE ---")
+    print(content[:2000] + ("..." if len(content) > 2000 else ""))
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
     except (json.JSONDecodeError, TypeError):
         reminder = user_message + "\n\nReturn valid JSON only."
         retry_content = _send_model_request(system_prompt, reminder, images)
-        return json.loads(retry_content)
+        print("\n--- RETRY RAW RESPONSE ---")
+        print(
+            retry_content[:2000]
+            + ("..." if len(retry_content) > 2000 else "")
+        )
+        parsed = json.loads(retry_content)
+
+    print("JSON parsed successfully")
+    print("Keys:", list(parsed.keys()))
+    return parsed
 
 
 def run_pipeline(
@@ -546,44 +612,86 @@ def run_pipeline(
     pipeline = load_csvs(dataset_dir, claims_filename=claims_filename)
     results = []
     claim_rows = pipeline.claims[:limit] if limit is not None else pipeline.claims
-    for source_row in claim_rows:
-        # Never expose expected-output columns from labeled sample data to the model.
-        row = {column: source_row.get(column, '') for column in INPUT_COLUMNS}
-        user_id = row.get('user_id')
-        history_note, history_flags = build_history_note(pipeline, user_id)
-        evidence_ctx = lookup_evidence_requirement(pipeline, row.get('claim_object'), row.get('issue_type'))
-        raw = classify_claim(pipeline, row, history_note, evidence_ctx)
-        validated = validate_and_repair(pipeline, raw, row)
-        # merge risk flags
-        model_flags = validated.get('risk_flags') or []
-        if isinstance(model_flags, str):
-            model_flags = [s.strip() for s in model_flags.split(';') if s.strip()]
-        merged = (set(model_flags) - {'none'}) | set(history_flags)
-        validated['risk_flags'] = sorted(merged) if merged else ['none']
-        # ensure supporting_image_ids filtered (validate_and_repair already filters)
-        # prepare output row
-        out_row = {
-            'user_id': row.get('user_id'),
-            'image_paths': row.get('image_paths'),
-            'user_claim': row.get('user_claim'),
-            'claim_object': row.get('claim_object'),
-            'evidence_standard_met': validated.get('evidence_standard_met'),
-            'evidence_standard_met_reason': validated.get('evidence_standard_met_reason',''),
-            'risk_flags': validated.get('risk_flags'),
-            'issue_type': validated.get('issue_type'),
-            'object_part': validated.get('object_part'),
-            'claim_status': validated.get('claim_status'),
-            'claim_status_justification': validated.get('claim_status_justification',''),
-            'supporting_image_ids': validated.get('supporting_image_ids'),
-            'valid_image': validated.get('valid_image'),
-            'severity': validated.get('severity')
-        }
-        results.append(out_row)
-
-    # write output
+    total_rows = len(claim_rows)
     if output_path is None:
         output_path = os.path.abspath(os.path.join(REPO_ROOT, 'output.csv'))
-    write_output(results, output_path)
+    output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    progress_path = os.path.join(os.path.dirname(output_path), 'progress.json')
+    progress_exists = os.path.isfile(progress_path)
+    last_completed_index = _load_progress(progress_path)
+
+    if last_completed_index < -1 or last_completed_index >= total_rows:
+        raise ValueError(
+            f'Invalid last_completed_index {last_completed_index} '
+            f'for {total_rows} claims'
+        )
+
+    if last_completed_index == -1:
+        with open(output_path, 'w', newline='', encoding='utf-8') as output_file:
+            writer = csv.writer(output_file)
+            writer.writerow(OUTPUT_COLUMNS)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        if not progress_exists:
+            _save_progress(progress_path, -1)
+    elif not os.path.isfile(output_path):
+        raise FileNotFoundError(
+            f'{output_path} is missing but {progress_path} indicates '
+            f'claim {last_completed_index} was completed'
+        )
+
+    start_index = last_completed_index + 1
+    print(f'Resuming from claim index {start_index}')
+
+    for index in range(start_index, total_rows):
+        source_row = claim_rows[index]
+        try:
+            # Never expose expected-output columns from labeled sample data to the model.
+            row = {column: source_row.get(column, '') for column in INPUT_COLUMNS}
+            user_id = row.get('user_id')
+            print(f"\n[{index + 1}/{total_rows}] Processing {user_id}")
+            history_note, history_flags = build_history_note(pipeline, user_id)
+            evidence_ctx = lookup_evidence_requirement(pipeline, row.get('claim_object'), row.get('issue_type'))
+            raw = classify_claim(pipeline, row, history_note, evidence_ctx)
+            print(f"[{index + 1}/{total_rows}] Model response parsed successfully")
+            validated = validate_and_repair(pipeline, raw, row)
+            # merge risk flags
+            model_flags = validated.get('risk_flags') or []
+            if isinstance(model_flags, str):
+                model_flags = [s.strip() for s in model_flags.split(';') if s.strip()]
+            merged = (set(model_flags) - {'none'}) | set(history_flags)
+            validated['risk_flags'] = sorted(merged) if merged else ['none']
+            # ensure supporting_image_ids filtered (validate_and_repair already filters)
+            # prepare output row
+            out_row = {
+                'user_id': row.get('user_id'),
+                'image_paths': row.get('image_paths'),
+                'user_claim': row.get('user_claim'),
+                'claim_object': row.get('claim_object'),
+                'evidence_standard_met': validated.get('evidence_standard_met'),
+                'evidence_standard_met_reason': validated.get('evidence_standard_met_reason',''),
+                'risk_flags': validated.get('risk_flags'),
+                'issue_type': validated.get('issue_type'),
+                'object_part': validated.get('object_part'),
+                'claim_status': validated.get('claim_status'),
+                'claim_status_justification': validated.get('claim_status_justification',''),
+                'supporting_image_ids': validated.get('supporting_image_ids'),
+                'valid_image': validated.get('valid_image'),
+                'severity': validated.get('severity')
+            }
+
+            # The checkpoint order is deliberate: process, append, then progress.
+            _append_output_row(out_row, output_path)
+            _save_progress(progress_path, index)
+            results.append(out_row)
+        except Exception as error:
+            print(f'Error processing claim index {index}: {error}')
+            raise
+
+    print(f"\nCheckpointed through claim index {total_rows - 1}")
+    print(f"Output: {output_path}")
+    print(f"Progress: {progress_path}")
     return results
 
 
